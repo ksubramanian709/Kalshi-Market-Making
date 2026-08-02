@@ -27,7 +27,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Export Kalshi MM results to CSV")
     parser.add_argument("--db-path", default="data/kalshi_mm.db")
     parser.add_argument("--out-dir", default="data/exports")
-    parser.add_argument("--starting-cash", type=float, default=1000.0)
+    parser.add_argument("--starting-cash", type=float, default=5000.0)
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db_path)

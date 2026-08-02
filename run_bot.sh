@@ -23,10 +23,10 @@ fi
 
 exec python -u main.py \
   "${MARKET_ARGS[@]}" \
-  --half-spread-cents 1 \
-  --quote-size 10 \
-  --max-position 50 \
-  --max-skew-cents 1 \
+  --half-spread-cents 5 \
+  --quote-size 50 \
+  --max-position 250 \
+  --max-skew-cents 5 \
   --max-divergence-cents 0 \
   --fair-value-refresh-sec 600 \
-  --starting-cash 1000
+  --starting-cash 5000

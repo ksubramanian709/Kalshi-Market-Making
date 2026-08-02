@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--starting-cash",
         type=float,
-        default=1000.0,
+        default=5000.0,
         help="Simulated starting cash for the paper portfolio (default: 1000.0)",
     )
     parser.add_argument(

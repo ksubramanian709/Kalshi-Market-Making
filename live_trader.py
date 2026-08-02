@@ -224,10 +224,14 @@ async def run(args: argparse.Namespace) -> None:
                             om.reset_ticker(ticker)
 
             except (WebSocketException, OSError, RuntimeError, json.JSONDecodeError) as e:
+                # Do NOT touch om.state here. This WebSocket carries market data only —
+                # real resting orders are exchange-side and unaffected by our own
+                # reconnects. Nulling local bid/ask tracking on every reconnect used to
+                # orphan a full duplicate set of real orders (the next successful sync
+                # would CREATE fresh ones believing nothing was resting, while the old,
+                # still-real orders sat forgotten). om.state stays accurate across a
+                # reconnect; the next sync will amend/cancel against it correctly.
                 print(f"[live] {e!s}; reconnecting in {backoff_s:.0f}s")
-                for t in om.state:
-                    om.state[t].bid = None
-                    om.state[t].ask = None
                 await asyncio.sleep(backoff_s)
                 backoff_s = min(backoff_s * 2, 60.0)
     finally:

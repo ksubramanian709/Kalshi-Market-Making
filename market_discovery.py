@@ -1,7 +1,18 @@
 """
-Finds the most liquid daily-high-temperature bucket market per city series
-for a given date, via Kalshi's unauthenticated REST market-data endpoints.
-Used by rollover.py to pick fresh tickers as each day's markets expire.
+Finds liquid markets to quote, via Kalshi's unauthenticated REST market-data
+endpoints. Two kinds of series are supported:
+
+- Weather bucket series (WEATHER_SERIES): one market per city per day, whose
+  exact threshold shifts daily with the forecast (rediscovered fresh).
+- Game series (GAME_SERIES): individual near-term game outcome markets
+  (MLB/NFL/WNBA/UCL etc.) — deliberately NOT season-long championship/award
+  futures, which behave more like informed-flow-dominated markets (thin
+  day-to-day activity, violent jumps on trade/injury news) than the boring,
+  high-volume, retail-heavy markets this bot is built for.
+
+discover_diverse_markets() combines both: weather cities as a fixed anchor
+(where the fair-value signal in weather_signal.py applies), topped up with
+capped-per-league game markets so no single sport can crowd out the rest.
 """
 from __future__ import annotations
 
@@ -11,14 +22,21 @@ from datetime import date
 
 REST_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
-# Same 5 cities used throughout the project; each city's actual bucket
-# threshold (e.g. B82.5 vs B84.5) shifts daily with the forecast, so we
-# rediscover the liquid one fresh each day rather than hardcoding it.
-SERIES = ["KXHIGHNY", "KXHIGHLAX", "KXHIGHMIA", "KXHIGHPHIL", "KXHIGHAUS"]
+WEATHER_SERIES = [
+    "KXHIGHNY", "KXHIGHLAX", "KXHIGHMIA", "KXHIGHPHIL", "KXHIGHAUS",
+    "KXHIGHCHI", "KXHIGHDEN",
+]
+GAME_SERIES = [
+    "KXMLBGAME", "KXNFLGAME", "KXNBAGAME", "KXWNBAGAME", "KXNHLGAME",
+    "KXMLSGAME", "KXUCLGAME",
+]
+# Kept for backwards compatibility with earlier code / tests.
+SERIES = WEATHER_SERIES
 
 MIN_BID_DOLLARS = 0.03
 MAX_ASK_DOLLARS = 0.97
 MIN_VOLUME_24H = 200
+MAX_PER_GAME_SERIES = 5
 
 
 def _ticker_date_suffix(target_date: date) -> str:
@@ -66,13 +84,55 @@ def find_liquid_market(series: str, target_date: date) -> str | None:
 
 
 def discover_active_markets(target_date: date | None = None) -> list[str]:
-    """Best liquid ticker per city series for target_date (default: today, UTC)."""
+    """Best liquid ticker per weather city series for target_date (default: today)."""
     target_date = target_date or date.today()
     tickers = []
-    for series in SERIES:
+    for series in WEATHER_SERIES:
         ticker = find_liquid_market(series, target_date)
         if ticker:
             tickers.append(ticker)
         else:
             print(f"[market_discovery] no liquid market found for {series} on {target_date}")
     return tickers
+
+
+def find_liquid_game_markets(series: str, limit: int = MAX_PER_GAME_SERIES) -> list[tuple[float, str]]:
+    """Up to `limit` liquid open markets in a game series, as (volume, ticker), sorted by volume desc."""
+    url = f"{REST_BASE}/markets?series_ticker={series}&status=open&limit=100"
+    try:
+        data = _fetch_json(url)
+    except Exception:
+        return []
+
+    candidates = []
+    for m in data.get("markets", []):
+        bid = _as_float(m, "yes_bid_dollars")
+        ask = _as_float(m, "yes_ask_dollars")
+        volume = _as_float(m, "volume_24h_fp")
+        if bid > MIN_BID_DOLLARS and ask < MAX_ASK_DOLLARS and volume > MIN_VOLUME_24H:
+            candidates.append((volume, m["ticker"]))
+
+    candidates.sort(reverse=True)
+    return candidates[:limit]
+
+
+def discover_diverse_markets(total_limit: int = 20, target_date: date | None = None) -> list[str]:
+    """
+    Weather cities (fixed anchor, one bucket each) topped up with capped-per-league
+    game markets, ranked by volume, capped at total_limit overall.
+    """
+    target_date = target_date or date.today()
+    weather_tickers = discover_active_markets(target_date)
+
+    game_candidates: list[tuple[float, str]] = []
+    for series in GAME_SERIES:
+        found = find_liquid_game_markets(series)
+        if not found:
+            print(f"[market_discovery] no liquid markets found for {series}")
+        game_candidates.extend(found)
+
+    game_candidates.sort(reverse=True)
+    remaining_slots = max(total_limit - len(weather_tickers), 0)
+    game_tickers = [t for _, t in game_candidates[:remaining_slots]]
+
+    return weather_tickers + game_tickers

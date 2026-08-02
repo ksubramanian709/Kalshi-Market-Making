@@ -1,23 +1,28 @@
 # Kalshi Market-Making
 
-A paper-trading market-making bot for [Kalshi](https://kalshi.com) prediction markets, focused on
-daily high-temperature contracts (e.g. *"Will the high in NYC be 82-83° on Aug 2?"*). It connects to
-Kalshi's real market data over WebSocket, quotes a spread around either the market midpoint or its own
-fair-value estimate (pulled from NWS weather data), simulates fills against real trade prints, and
-tracks a simulated cash/position ledger — **no real orders are ever placed.**
+A paper-trading market-making bot for [Kalshi](https://kalshi.com) prediction markets: daily
+high-temperature bucket contracts (e.g. *"Will the high in NYC be 82-83° on Aug 2?"*) and near-term
+single-game sports markets (MLB, NFL, WNBA, UCL). It connects to Kalshi's real market data over
+WebSocket, quotes a spread around either the market midpoint or (for weather markets) its own
+fair-value estimate pulled from NWS data, simulates fills against real trade prints, and tracks a
+simulated cash/position ledger — **no real orders are ever placed.**
 
 > **Status: paper trading only.** Every number in this repo — fills, P&L, positions — is simulated.
 > See [Honesty / limitations](#honesty--limitations) before reading too much into any of it, and
 > definitely before considering real capital.
 
-## Why market making, and why weather
+## Why market making, and why these markets
 
 Kalshi isn't a continuous market like an equity exchange — it's binary event contracts, and most
-flagship markets (Fed decisions, elections) are dominated by informed flow that eats naive market
-makers alive. Daily weather-threshold contracts are the opposite: high-volume, mostly retail-driven,
-and boring enough that a simple strategy has a chance to learn the mechanics — order book handling,
-inventory risk, adverse selection — without being immediately picked apart by someone who knows more
-than you.
+flagship markets (Fed decisions, elections, season-long championship/award futures) are dominated by
+informed flow that eats naive market makers alive: thin day-to-day activity punctuated by violent
+one-directional jumps on news. Daily weather-threshold contracts and single-game sports outcomes are
+the opposite — high-volume, mostly retail-driven, resolve within a day or two (so any mispricing gets
+refreshed constantly instead of sitting exposed for months), and boring enough that a simple strategy
+has a chance to learn the mechanics — order book handling, inventory risk, adverse selection — without
+being immediately picked apart by someone who knows more than you. `market_discovery.py` deliberately
+targets game-level series (`KXMLBGAME`, `KXNFLGAME`, `KXWNBAGAME`, `KXUCLGAME`, ...), not season-long
+futures series, for exactly this reason.
 
 ## Architecture
 
@@ -179,13 +184,14 @@ launchctl bootout gui/$(id -u)/com.kalshimm.bot                                 
 
 ### Daily market rollover
 
-These are same-day contracts, so `run_bot.sh` runs `rollover.py` on every launch —
-it queries Kalshi REST for the most liquid open bucket market per city (bid > $0.03, ask < $0.97,
-24h volume > 200) and writes the result to `data/active_markets.txt`, which `run_bot.sh` reads to
-build the `--market` list. `com.kalshimm.rollover.plist` forces a bot restart once daily (6am) so this
-refresh actually happens even if the bot itself never crashes. If discovery comes back empty (e.g. too
-early before a new day's markets have liquidity), the previous ticker list is left untouched rather
-than emptied.
+Most of these are same-day/near-term contracts, so `run_bot.sh` runs `rollover.py` on every launch —
+it queries Kalshi REST for liquid markets (bid > $0.03, ask < $0.97, 24h volume > 200), taking one
+bucket per weather city as a fixed anchor and topping up with capped-per-league game markets
+(`discover_diverse_markets()`, default cap 20 total, `--limit` to change), and writes the result to
+`data/active_markets.txt`, which `run_bot.sh` reads to build the `--market` list.
+`com.kalshimm.rollover.plist` forces a bot restart once daily (6am) so this refresh actually happens
+even if the bot itself never crashes. If discovery comes back empty (e.g. too early before a new day's
+markets have liquidity), the previous ticker list is left untouched rather than emptied.
 
 ## Honesty / limitations
 

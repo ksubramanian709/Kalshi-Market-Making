@@ -1,17 +1,19 @@
 """
-Exports current results to a single .xlsx workbook (Summary, Current Status,
-Fills, Portfolio History tabs) that opens directly in Excel/Numbers.
-Safe to run while main.py is running (SQLite WAL allows concurrent readers).
+Exports current results to a single .xlsx workbook (Summary, Model
+Comparison, Current Status, Fills, Portfolio History tabs) that opens
+directly in Excel/Numbers. Safe to run while main.py is running (SQLite
+WAL allows concurrent readers).
 """
 from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Font
+
+import storage
 
 
 def write_sheet(ws, headers: list[str], rows: list[tuple]) -> None:
@@ -25,6 +27,19 @@ def write_sheet(ws, headers: list[str], rows: list[tuple]) -> None:
         ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 10), 40)
 
 
+def portfolio_summary(conn, model: str, mids: dict, starting_cash: float) -> tuple[float, dict, float]:
+    row = conn.execute(
+        "SELECT cash, positions_json FROM portfolio_snapshots WHERE model=? ORDER BY ts DESC LIMIT 1",
+        (model,),
+    ).fetchone()
+    if not row:
+        return starting_cash, {}, starting_cash
+    cash, positions_json = row
+    positions = json.loads(positions_json)
+    mtm = cash + sum(pos * mids.get(t, 0) for t, pos in positions.items())
+    return cash, positions, mtm
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export Kalshi MM results to .xlsx")
     parser.add_argument("--db-path", default="data/kalshi_mm.db")
@@ -32,7 +47,7 @@ def main() -> None:
     parser.add_argument("--starting-cash", type=float, default=5000.0)
     args = parser.parse_args()
 
-    conn = sqlite3.connect(args.db_path)
+    conn = storage.connect(args.db_path)
 
     status_rows = conn.execute(
         """
@@ -51,23 +66,17 @@ def main() -> None:
 
     fill_rows = conn.execute(
         "SELECT ticker, datetime(ts, 'unixepoch', 'localtime') AS time, side, price, qty, "
-        "cash_after, position_after FROM fills ORDER BY ts DESC"
+        "cash_after, position_after, model FROM fills ORDER BY ts DESC"
     ).fetchall()
 
     portfolio_rows = conn.execute(
-        "SELECT datetime(ts, 'unixepoch', 'localtime') AS time, cash, positions_json "
+        "SELECT datetime(ts, 'unixepoch', 'localtime') AS time, cash, positions_json, model "
         "FROM portfolio_snapshots ORDER BY ts DESC"
     ).fetchall()
 
-    latest = conn.execute(
-        "SELECT cash, positions_json FROM portfolio_snapshots ORDER BY ts DESC LIMIT 1"
-    ).fetchone()
-    cash, positions, mtm = args.starting_cash, {}, args.starting_cash
-    if latest:
-        cash, positions_json = latest
-        positions = json.loads(positions_json)
-        mids = {r[0]: (r[2] + r[4]) / 2 / 100 for r in status_rows if r[2] is not None and r[4] is not None}
-        mtm = cash + sum(pos * mids.get(t, 0) for t, pos in positions.items())
+    mids = {r[0]: (r[2] + r[4]) / 2 / 100 for r in status_rows if r[2] is not None and r[4] is not None}
+    cash, positions, mtm = portfolio_summary(conn, "optimistic", mids, args.starting_cash)
+    cash_c, positions_c, mtm_c = portfolio_summary(conn, "conservative", mids, args.starting_cash)
 
     wb = Workbook()
 
@@ -77,6 +86,20 @@ def main() -> None:
         ws_summary,
         ["cash", "mark_to_market", "pnl_vs_starting_cash", "starting_cash", "open_positions"],
         [(round(cash, 2), round(mtm, 2), round(mtm - args.starting_cash, 2), args.starting_cash, str(positions))],
+    )
+
+    ws_compare = wb.create_sheet("Model Comparison")
+    write_sheet(
+        ws_compare,
+        ["model", "cash", "mark_to_market", "pnl_vs_starting_cash", "positions"],
+        [
+            ("optimistic (any crossing trade fills us)", round(cash, 2), round(mtm, 2),
+             round(mtm - args.starting_cash, 2), str(positions)),
+            ("conservative (queue-aware, needs real volume to clear depth ahead of us)",
+             round(cash_c, 2), round(mtm_c, 2), round(mtm_c - args.starting_cash, 2), str(positions_c)),
+            ("GAP (optimistic - conservative) — the quantified effect of ignoring queue priority",
+             round(cash - cash_c, 2), round(mtm - mtm_c, 2), round((mtm - args.starting_cash) - (mtm_c - args.starting_cash), 2), ""),
+        ],
     )
 
     ws_status = wb.create_sheet("Current Status")
@@ -90,18 +113,19 @@ def main() -> None:
     ws_fills = wb.create_sheet("Fills")
     write_sheet(
         ws_fills,
-        ["ticker", "time", "side", "price", "qty", "cash_after", "position_after"],
+        ["ticker", "time", "side", "price", "qty", "cash_after", "position_after", "model"],
         fill_rows,
     )
 
     ws_portfolio = wb.create_sheet("Portfolio History")
-    write_sheet(ws_portfolio, ["time", "cash", "positions_json"], portfolio_rows)
+    write_sheet(ws_portfolio, ["time", "cash", "positions_json", "model"], portfolio_rows)
 
     out_path = Path(args.out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
     conn.close()
-    print(f"wrote {out_path} ({len(status_rows)} markets, {len(fill_rows)} fills)")
+    print(f"wrote {out_path} ({len(status_rows)} markets, {len(fill_rows)} fills, "
+          f"gap={mtm - mtm_c:+.2f})")
 
 
 if __name__ == "__main__":

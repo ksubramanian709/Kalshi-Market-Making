@@ -20,6 +20,7 @@ import certifi
 import websockets
 from websockets.exceptions import WebSocketException
 
+import queue_model
 import storage
 import strategy
 import weather_signal
@@ -99,6 +100,7 @@ def _requote(
     portfolio: PaperPortfolio,
     quotes: dict[str, strategy.Quote],
     fair_values: dict[str, int | None],
+    queue_states: dict[str, queue_model.QueueState],
     *,
     half_spread_cents: int,
     quote_size: int,
@@ -126,6 +128,22 @@ def _requote(
         quote.ask_size,
     ):
         storage.insert_quote(conn, ticker, quote)
+
+    # Sync the queue-aware (conservative) fill model's notion of "how much real
+    # size is resting ahead of us" — only actually resets when the price
+    # changed (see queue_model.sync_quote_price). Uses the real book's depth
+    # at our (possibly new) quote price, which by construction never includes
+    # our own hypothetical order.
+    qs = queue_states.setdefault(ticker, queue_model.QueueState())
+    resting_at_bid = book.yes.get(quote.bid_price, 0) if quote.bid_price is not None else 0
+    resting_at_ask = book.no.get(100 - quote.ask_price, 0) if quote.ask_price is not None else 0
+    queue_model.sync_quote_price(
+        qs,
+        new_bid_price=quote.bid_price,
+        new_ask_price=quote.ask_price,
+        resting_at_bid=resting_at_bid,
+        resting_at_ask=resting_at_ask,
+    )
 
 
 def _simulate_fill(
@@ -173,6 +191,59 @@ def _simulate_fill(
     return False
 
 
+def _simulate_conservative_fill(
+    conn: sqlite3.Connection,
+    ticker: str,
+    trade: dict,
+    quote: strategy.Quote,
+    qs: queue_model.QueueState,
+    portfolio_conservative: PaperPortfolio,
+) -> None:
+    """
+    Queue-aware counterpart to _simulate_fill: only fills once real trade
+    volume at this price has consumed the real depth that was resting ahead
+    of us. Evaluated against the SAME quote as the optimistic model (see
+    queue_model.py) so any P&L difference between the two isolates the
+    fill-assumption effect specifically, not a difference in what we quoted.
+    """
+    price = trade.get("yes_price")
+    count = trade.get("count")
+    if price is None or count is None:
+        return
+
+    bid_fill, ask_fill = queue_model.on_trade(
+        qs,
+        price,
+        count,
+        quote_bid_price=quote.bid_price,
+        quote_bid_size=quote.bid_size,
+        quote_ask_price=quote.ask_price,
+        quote_ask_size=quote.ask_size,
+    )
+
+    if bid_fill > 0:
+        portfolio_conservative.apply_fill(ticker, "buy_yes", quote.bid_price, bid_fill)
+        storage.insert_fill(
+            conn, ticker, "buy_yes", quote.bid_price, bid_fill,
+            portfolio_conservative.cash, portfolio_conservative.position(ticker), model="conservative",
+        )
+        print(
+            f"[fill:conservative] {ticker} BUY {bid_fill}@{quote.bid_price}c "
+            f"cash={portfolio_conservative.cash:.2f} pos={portfolio_conservative.position(ticker)}"
+        )
+
+    if ask_fill > 0:
+        portfolio_conservative.apply_fill(ticker, "sell_yes", quote.ask_price, ask_fill)
+        storage.insert_fill(
+            conn, ticker, "sell_yes", quote.ask_price, ask_fill,
+            portfolio_conservative.cash, portfolio_conservative.position(ticker), model="conservative",
+        )
+        print(
+            f"[fill:conservative] {ticker} SELL {ask_fill}@{quote.ask_price}c "
+            f"cash={portfolio_conservative.cash:.2f} pos={portfolio_conservative.position(ticker)}"
+        )
+
+
 async def _refresh_fair_values(
     conn: sqlite3.Connection,
     books: dict[str, OrderBook],
@@ -217,6 +288,7 @@ async def _periodic_snapshots(
     conn: sqlite3.Connection,
     books: dict[str, OrderBook],
     portfolio: PaperPortfolio,
+    portfolio_conservative: PaperPortfolio,
     interval_sec: float,
 ) -> None:
     while True:
@@ -227,9 +299,19 @@ async def _periodic_snapshots(
             top = book.top_of_book()
             if top.get("best_bid") is not None and top.get("best_ask") is not None:
                 mids[ticker] = (top["best_bid"] + top["best_ask"]) / 2
+
         mtm = portfolio.mark_to_market(mids)
-        storage.insert_portfolio_snapshot(conn, portfolio.cash, dict(portfolio.positions))
+        storage.insert_portfolio_snapshot(conn, portfolio.cash, dict(portfolio.positions), model="optimistic")
         print(f"[portfolio] cash={portfolio.cash:.2f} positions={portfolio.positions} mark_to_market={mtm:.2f}")
+
+        mtm_c = portfolio_conservative.mark_to_market(mids)
+        storage.insert_portfolio_snapshot(
+            conn, portfolio_conservative.cash, dict(portfolio_conservative.positions), model="conservative"
+        )
+        print(
+            f"[portfolio:conservative] cash={portfolio_conservative.cash:.2f} "
+            f"positions={portfolio_conservative.positions} mark_to_market={mtm_c:.2f}"
+        )
 
 
 async def stream_orderbook(
@@ -237,6 +319,7 @@ async def stream_orderbook(
     tickers: list[str],
     get_headers: Callable[[], dict[str, str] | None],
     portfolio: PaperPortfolio,
+    portfolio_conservative: PaperPortfolio,
     *,
     url: str | None = None,
     snapshot_interval_sec: float = 5.0,
@@ -251,18 +334,23 @@ async def stream_orderbook(
     Connect, subscribe to orderbook_delta + trade for the given tickers,
     maintain local book state, quote around our fair-value estimate (when
     available) with inventory skew, and simulate fills against real trade
-    prints into `portfolio`.
+    prints into `portfolio` (optimistic: any crossing trade fills us) and,
+    in parallel against the identical quotes, into `portfolio_conservative`
+    (queue-aware: only fills once real volume clears the depth resting ahead
+    of us) — see queue_model.py. Comparing the two quantifies how much the
+    optimistic model's fill-frequency assumption actually matters.
     """
     ws_url = url or websocket_url()
     ticker_set = set(tickers)
     books: dict[str, OrderBook] = {t: OrderBook(t) for t in tickers}
     quotes: dict[str, strategy.Quote] = {}
     fair_values: dict[str, int | None] = {}
+    queue_states: dict[str, queue_model.QueueState] = {t: queue_model.QueueState() for t in tickers}
     backoff_s = 1.0
     msg_id = 1
 
     snapshot_task = asyncio.create_task(
-        _periodic_snapshots(conn, books, portfolio, snapshot_interval_sec)
+        _periodic_snapshots(conn, books, portfolio, portfolio_conservative, snapshot_interval_sec)
     )
     fair_value_task = asyncio.create_task(
         _refresh_fair_values(conn, books, fair_values, fair_value_refresh_sec)
@@ -321,7 +409,7 @@ async def stream_orderbook(
                             storage.insert_book_snapshot(conn, ticker, book.depth_snapshot())
                             storage.insert_book_top(conn, ticker, book.top_of_book())
                             _requote(
-                                conn, ticker, book, portfolio, quotes, fair_values,
+                                conn, ticker, book, portfolio, quotes, fair_values, queue_states,
                                 half_spread_cents=half_spread_cents,
                                 quote_size=quote_size, max_position=max_position,
                                 max_skew_cents=max_skew_cents,
@@ -333,7 +421,7 @@ async def stream_orderbook(
                             _assert_not_crossed(ticker, book)
                             storage.insert_book_top(conn, ticker, book.top_of_book())
                             _requote(
-                                conn, ticker, book, portfolio, quotes, fair_values,
+                                conn, ticker, book, portfolio, quotes, fair_values, queue_states,
                                 half_spread_cents=half_spread_cents,
                                 quote_size=quote_size, max_position=max_position,
                                 max_skew_cents=max_skew_cents,
@@ -347,14 +435,17 @@ async def stream_orderbook(
                                 f"count={trade['count']} taker={trade['taker_side']}"
                             )
                             quote = quotes.get(ticker)
-                            if quote is not None and _simulate_fill(conn, ticker, trade, quote, portfolio):
-                                _requote(
-                                    conn, ticker, books[ticker], portfolio, quotes, fair_values,
-                                    half_spread_cents=half_spread_cents,
-                                    quote_size=quote_size, max_position=max_position,
-                                    max_skew_cents=max_skew_cents,
-                                    max_divergence_cents=max_divergence_cents,
-                                )
+                            if quote is not None:
+                                qs = queue_states.setdefault(ticker, queue_model.QueueState())
+                                _simulate_conservative_fill(conn, ticker, trade, quote, qs, portfolio_conservative)
+                                if _simulate_fill(conn, ticker, trade, quote, portfolio):
+                                    _requote(
+                                        conn, ticker, books[ticker], portfolio, quotes, fair_values, queue_states,
+                                        half_spread_cents=half_spread_cents,
+                                        quote_size=quote_size, max_position=max_position,
+                                        max_skew_cents=max_skew_cents,
+                                        max_divergence_cents=max_divergence_cents,
+                                    )
                         elif kind == "error":
                             err = msg or {}
                             print(f"[WS error] {err.get('code')}: {err.get('msg')}")

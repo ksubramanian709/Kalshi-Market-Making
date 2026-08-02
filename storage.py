@@ -55,14 +55,16 @@ CREATE TABLE IF NOT EXISTS fills (
     price INTEGER NOT NULL,
     qty INTEGER NOT NULL,
     cash_after REAL NOT NULL,
-    position_after INTEGER NOT NULL
+    position_after INTEGER NOT NULL,
+    model TEXT NOT NULL DEFAULT 'optimistic'
 );
 CREATE INDEX IF NOT EXISTS idx_fills_ticker_ts ON fills(ticker, ts);
 
 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
     ts REAL NOT NULL,
     cash REAL NOT NULL,
-    positions_json TEXT NOT NULL
+    positions_json TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT 'optimistic'
 );
 CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_ts ON portfolio_snapshots(ts);
 
@@ -77,11 +79,20 @@ CREATE INDEX IF NOT EXISTS idx_fair_values_ticker_ts ON fair_values(ticker, ts);
 """
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    # Lightweight migration for DBs created before the `model` column existed.
+    _ensure_column(conn, "fills", "model", "model TEXT NOT NULL DEFAULT 'optimistic'")
+    _ensure_column(conn, "portfolio_snapshots", "model", "model TEXT NOT NULL DEFAULT 'optimistic'")
     conn.commit()
     return conn
 
@@ -154,21 +165,26 @@ def insert_fill(
     cash_after: float,
     position_after: int,
     ts: float | None = None,
+    model: str = "optimistic",
 ) -> None:
     conn.execute(
-        "INSERT INTO fills (ticker, ts, side, price, qty, cash_after, position_after) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (ticker, ts if ts is not None else time.time(), side, price, qty, cash_after, position_after),
+        "INSERT INTO fills (ticker, ts, side, price, qty, cash_after, position_after, model) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (ticker, ts if ts is not None else time.time(), side, price, qty, cash_after, position_after, model),
     )
     conn.commit()
 
 
 def insert_portfolio_snapshot(
-    conn: sqlite3.Connection, cash: float, positions: dict[str, int], ts: float | None = None
+    conn: sqlite3.Connection,
+    cash: float,
+    positions: dict[str, int],
+    ts: float | None = None,
+    model: str = "optimistic",
 ) -> None:
     conn.execute(
-        "INSERT INTO portfolio_snapshots (ts, cash, positions_json) VALUES (?, ?, ?)",
-        (ts if ts is not None else time.time(), cash, json.dumps(positions)),
+        "INSERT INTO portfolio_snapshots (ts, cash, positions_json, model) VALUES (?, ?, ?, ?)",
+        (ts if ts is not None else time.time(), cash, json.dumps(positions), model),
     )
     conn.commit()
 

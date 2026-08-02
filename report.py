@@ -9,6 +9,8 @@ import argparse
 import json
 import sqlite3
 
+import storage
+
 
 def latest_per_ticker(conn: sqlite3.Connection, table: str, cols: str) -> list[tuple]:
     return conn.execute(
@@ -31,7 +33,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    conn = sqlite3.connect(args.db_path)
+    conn = storage.connect(args.db_path)
 
     print("=== Current book (top of book) ===")
     for ticker, ts, bb, bbq, ba, baq in latest_per_ticker(
@@ -45,37 +47,62 @@ def main() -> None:
     ):
         print(f"  {ticker}: bid {bp}c x{bs}  ask {ap}c x{aszs}")
 
-    print("\n=== Fills ===")
+    print("\n=== Fills (optimistic) ===")
     fills = conn.execute(
         "SELECT ticker, datetime(ts, 'unixepoch', 'localtime'), side, price, qty, cash_after, position_after "
-        "FROM fills ORDER BY ts"
+        "FROM fills WHERE model='optimistic' ORDER BY ts"
     ).fetchall()
     if not fills:
         print("  (none yet)")
     for ticker, ts, side, price, qty, cash_after, pos_after in fills:
         print(f"  {ts}  {ticker}  {side} {qty}@{price}c  cash={cash_after:.2f}  pos={pos_after}")
 
-    print("\n=== Portfolio ===")
-    row = conn.execute(
-        "SELECT ts, cash, positions_json FROM portfolio_snapshots ORDER BY ts DESC LIMIT 1"
-    ).fetchone()
-    if row:
-        ts, cash, positions_json = row
+    n_conservative_fills = conn.execute(
+        "SELECT COUNT(*) FROM fills WHERE model='conservative'"
+    ).fetchone()[0]
+    print(f"\n=== Fills (conservative / queue-aware): {n_conservative_fills} total ===")
+
+    mids = {}
+    for ticker, _ts2, bb, _bbq, ba, _baq in latest_per_ticker(
+        conn, "book_top", "ticker, ts, best_bid, best_bid_qty, best_ask, best_ask_qty"
+    ):
+        if bb is not None and ba is not None:
+            mids[ticker] = (bb + ba) / 2
+
+    def portfolio_summary(model: str) -> tuple[float, dict, float] | None:
+        row = conn.execute(
+            "SELECT cash, positions_json FROM portfolio_snapshots WHERE model=? ORDER BY ts DESC LIMIT 1",
+            (model,),
+        ).fetchone()
+        if not row:
+            return None
+        cash, positions_json = row
         positions = json.loads(positions_json)
-        mids = {}
-        for ticker, _ts2, bb, _bbq, ba, _baq in latest_per_ticker(
-            conn, "book_top", "ticker, ts, best_bid, best_bid_qty, best_ask, best_ask_qty"
-        ):
-            if bb is not None and ba is not None:
-                mids[ticker] = (bb + ba) / 2
         mtm = cash + sum(pos * (mids[t] / 100) for t, pos in positions.items() if t in mids)
-        print(f"  cash: {cash:.2f}")
-        print(f"  positions: {positions}")
-        print(f"  mark-to-market: {mtm:.2f}")
+        return cash, positions, mtm
+
+    print("\n=== Portfolio: optimistic vs conservative (queue-aware) ===")
+    opt = portfolio_summary("optimistic")
+    cons = portfolio_summary("conservative")
+    if opt:
+        cash, positions, mtm = opt
+        print(f"  [optimistic]   cash: {cash:.2f}  mark-to-market: {mtm:.2f}  positions: {positions}")
         if args.starting_cash is not None:
-            print(f"  P&L vs starting cash ({args.starting_cash:.2f}): {mtm - args.starting_cash:+.2f}")
+            print(f"                 P&L vs starting cash ({args.starting_cash:.2f}): {mtm - args.starting_cash:+.2f}")
     else:
-        print("  (no snapshot yet)")
+        print("  [optimistic]   (no snapshot yet)")
+    if cons:
+        cash_c, positions_c, mtm_c = cons
+        print(f"  [conservative] cash: {cash_c:.2f}  mark-to-market: {mtm_c:.2f}  positions: {positions_c}")
+        if args.starting_cash is not None:
+            print(f"                 P&L vs starting cash ({args.starting_cash:.2f}): {mtm_c - args.starting_cash:+.2f}")
+    else:
+        print("  [conservative] (no snapshot yet)")
+    if opt and cons:
+        gap = opt[2] - cons[2]
+        print(f"\n  >>> Fill-model gap (optimistic mtm - conservative mtm): {gap:+.2f} <<<")
+        print("      This is the quantified effect of ignoring queue priority — the answer to")
+        print("      'how much would this affect us before going live.'")
 
     conn.close()
 

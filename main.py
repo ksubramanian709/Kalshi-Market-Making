@@ -102,12 +102,14 @@ async def run(args: argparse.Namespace) -> None:
     max_skew_cents = args.max_skew_cents if args.max_skew_cents is not None else args.half_spread_cents
     conn = storage.connect(args.db_path)
     portfolio = PaperPortfolio(starting_cash=args.starting_cash)
+    portfolio_conservative = PaperPortfolio(starting_cash=args.starting_cash)
     print(
         f"[main] logging to {args.db_path}, markets={args.market}, "
         f"starting_cash={args.starting_cash}, half_spread={args.half_spread_cents}c, "
         f"quote_size={args.quote_size}, max_position={args.max_position}, "
         f"max_skew_cents={max_skew_cents}, max_divergence_cents={args.max_divergence_cents}, "
-        f"fair_value_refresh_sec={args.fair_value_refresh_sec}"
+        f"fair_value_refresh_sec={args.fair_value_refresh_sec} "
+        f"(also running a parallel queue-aware 'conservative' fill model for comparison)"
     )
     try:
         await ws_client.stream_orderbook(
@@ -115,6 +117,7 @@ async def run(args: argparse.Namespace) -> None:
             args.market,
             kalshi_auth.build_websocket_headers,
             portfolio,
+            portfolio_conservative,
             snapshot_interval_sec=args.snapshot_interval_sec,
             half_spread_cents=args.half_spread_cents,
             quote_size=args.quote_size,

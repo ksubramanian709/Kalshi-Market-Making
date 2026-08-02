@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sqlite3
 from pathlib import Path
+
+import storage
 
 
 def export_table(conn: sqlite3.Connection, query: str, out_path: Path) -> int:
@@ -23,6 +26,19 @@ def export_table(conn: sqlite3.Connection, query: str, out_path: Path) -> int:
     return len(rows)
 
 
+def portfolio_summary(conn: sqlite3.Connection, model: str, mids: dict, starting_cash: float) -> tuple[float, dict, float]:
+    row = conn.execute(
+        "SELECT cash, positions_json FROM portfolio_snapshots WHERE model=? ORDER BY ts DESC LIMIT 1",
+        (model,),
+    ).fetchone()
+    if not row:
+        return starting_cash, {}, starting_cash
+    cash, positions_json = row
+    positions = json.loads(positions_json)
+    mtm = cash + sum(pos * mids.get(t, 0) for t, pos in positions.items())
+    return cash, positions, mtm
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export Kalshi MM results to CSV")
     parser.add_argument("--db-path", default="data/kalshi_mm.db")
@@ -30,19 +46,19 @@ def main() -> None:
     parser.add_argument("--starting-cash", type=float, default=5000.0)
     args = parser.parse_args()
 
-    conn = sqlite3.connect(args.db_path)
+    conn = storage.connect(args.db_path)
     out_dir = Path(args.out_dir)
 
     n_fills = export_table(
         conn,
         "SELECT ticker, datetime(ts, 'unixepoch', 'localtime') AS time, side, price, qty, "
-        "cash_after, position_after FROM fills ORDER BY ts",
+        "cash_after, position_after, model FROM fills ORDER BY ts",
         out_dir / "fills.csv",
     )
 
     n_portfolio = export_table(
         conn,
-        "SELECT datetime(ts, 'unixepoch', 'localtime') AS time, cash, positions_json "
+        "SELECT datetime(ts, 'unixepoch', 'localtime') AS time, cash, positions_json, model "
         "FROM portfolio_snapshots ORDER BY ts",
         out_dir / "portfolio_history.csv",
     )
@@ -71,22 +87,20 @@ def main() -> None:
         writer.writerow(cols)
         writer.writerows(rows)
 
-    row = conn.execute(
-        "SELECT cash, positions_json FROM portfolio_snapshots ORDER BY ts DESC LIMIT 1"
-    ).fetchone()
-    if row:
-        import json
-        cash, positions_json = row
-        positions = json.loads(positions_json)
-        mids = {r[0]: (r[2] + r[4]) / 2 / 100 for r in rows if r[2] is not None and r[4] is not None}
-        mtm = cash + sum(pos * mids.get(t, 0) for t, pos in positions.items())
-        with open(out_dir / "pnl_summary.csv", "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["cash", "mark_to_market", "pnl_vs_starting_cash", "starting_cash"])
-            writer.writerow([f"{cash:.2f}", f"{mtm:.2f}", f"{mtm - args.starting_cash:.2f}", args.starting_cash])
+    mids = {r[0]: (r[2] + r[4]) / 2 / 100 for r in rows if r[2] is not None and r[4] is not None}
+    cash, positions, mtm = portfolio_summary(conn, "optimistic", mids, args.starting_cash)
+    cash_c, positions_c, mtm_c = portfolio_summary(conn, "conservative", mids, args.starting_cash)
+
+    with open(out_dir / "pnl_summary.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["model", "cash", "mark_to_market", "pnl_vs_starting_cash", "starting_cash"])
+        writer.writerow(["optimistic", f"{cash:.2f}", f"{mtm:.2f}", f"{mtm - args.starting_cash:.2f}", args.starting_cash])
+        writer.writerow(["conservative", f"{cash_c:.2f}", f"{mtm_c:.2f}", f"{mtm_c - args.starting_cash:.2f}", args.starting_cash])
+        writer.writerow(["gap (optimistic - conservative)", f"{cash - cash_c:.2f}", f"{mtm - mtm_c:.2f}", "", ""])
 
     conn.close()
-    print(f"exported {n_fills} fills, {n_portfolio} portfolio snapshots, {len(rows)} market statuses to {out_dir}/")
+    print(f"exported {n_fills} fills, {n_portfolio} portfolio snapshots, {len(rows)} market statuses to {out_dir}/ "
+          f"(fill-model gap: {mtm - mtm_c:+.2f})")
 
 
 if __name__ == "__main__":

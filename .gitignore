@@ -1,0 +1,17 @@
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/exports/
+data/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Env / secrets
+.env
+.env.sh
+*.key
+*.pem

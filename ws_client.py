@@ -1,0 +1,336 @@
+"""
+Kalshi WebSocket client for market-making: subscribes to orderbook_delta +
+trade channels for a set of markets, maintains local OrderBook state per
+ticker, computes static-spread quotes, and simulates fills against real
+trade prints. No real orders are ever placed here — see portfolio.py for
+the paper P&L tracking this feeds.
+
+https://docs.kalshi.com/getting_started/quick_start_websockets
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sqlite3
+import ssl
+from collections.abc import Callable
+
+import certifi
+import websockets
+from websockets.exceptions import WebSocketException
+
+import storage
+import strategy
+import weather_signal
+from orderbook import OrderBook
+from portfolio import PaperPortfolio
+
+WS_URL_PROD = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+WS_URL_DEMO = "wss://demo-api.kalshi.co/trade-api/ws/v2"
+
+
+def websocket_url() -> str:
+    return os.environ.get("KALSHI_WS_URL") or (
+        WS_URL_DEMO if os.environ.get("KALSHI_USE_DEMO") else WS_URL_PROD
+    )
+
+
+def _as_header_list(headers: dict[str, str]) -> list[tuple[str, str]]:
+    return [(k, v) for k, v in headers.items()]
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Use certifi CA bundle (fixes macOS python.org builds missing system certs)."""
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def _fresh_headers(get_headers: Callable[[], dict[str, str] | None]) -> dict[str, str]:
+    h = get_headers()
+    if not h:
+        raise RuntimeError("WebSocket auth headers unavailable")
+    return h
+
+
+def _parse_trade(msg: dict) -> dict:
+    """
+    Normalize a trade message to {yes_price (cents), count, taker_side, trade_id}.
+    Kalshi's live payloads use dollar-string fields (yes_price_dollars, count_fp)
+    for orderbook/ticker channels; trade messages are assumed to match but we
+    fall back to the plain integer fields the docs describe in case they don't.
+    """
+    if "yes_price_dollars" in msg:
+        yes_price = round(float(msg["yes_price_dollars"]) * 100)
+    else:
+        yes_price = msg.get("yes_price")
+
+    if "count_fp" in msg:
+        count = round(float(msg["count_fp"]))
+    else:
+        count = msg.get("count")
+
+    return {
+        "trade_id": msg.get("trade_id"),
+        "yes_price": yes_price,
+        "count": count,
+        "taker_side": msg.get("taker_side"),
+    }
+
+
+def _requote(
+    conn: sqlite3.Connection,
+    ticker: str,
+    book: OrderBook,
+    portfolio: PaperPortfolio,
+    quotes: dict[str, strategy.Quote],
+    fair_values: dict[str, int | None],
+    *,
+    half_spread_cents: int,
+    quote_size: int,
+    max_position: int,
+    max_skew_cents: int,
+    max_divergence_cents: int,
+) -> None:
+    """Recompute our quote for a ticker and log it if it changed."""
+    prev = quotes.get(ticker)
+    quote = strategy.compute_quotes(
+        book.top_of_book(),
+        half_spread_cents=half_spread_cents,
+        quote_size=quote_size,
+        position=portfolio.position(ticker),
+        max_position=max_position,
+        max_skew_cents=max_skew_cents,
+        fair_value_cents=fair_values.get(ticker),
+        max_divergence_cents=max_divergence_cents,
+    )
+    quotes[ticker] = quote
+    if prev is None or (prev.bid_price, prev.bid_size, prev.ask_price, prev.ask_size) != (
+        quote.bid_price,
+        quote.bid_size,
+        quote.ask_price,
+        quote.ask_size,
+    ):
+        storage.insert_quote(conn, ticker, quote)
+
+
+def _simulate_fill(
+    conn: sqlite3.Connection,
+    ticker: str,
+    trade: dict,
+    quote: strategy.Quote,
+    portfolio: PaperPortfolio,
+) -> bool:
+    """
+    Simplified fill model: if a real trade prints at or through our resting
+    price, assume we'd have been filled. This ignores queue priority ahead of
+    us, so it's an optimistic upper bound on real fill frequency, not a
+    faithful match-engine simulation.
+
+    Returns True if a fill was simulated (caller should requote afterward).
+    """
+    price = trade.get("yes_price")
+    count = trade.get("count")
+    if price is None or count is None:
+        return False
+
+    if quote.bid_size > 0 and quote.bid_price is not None and price <= quote.bid_price:
+        qty = min(count, quote.bid_size)
+        if qty <= 0:
+            return False
+        portfolio.apply_fill(ticker, "buy_yes", quote.bid_price, qty)
+        storage.insert_fill(
+            conn, ticker, "buy_yes", quote.bid_price, qty, portfolio.cash, portfolio.position(ticker)
+        )
+        print(f"[fill] {ticker} BUY {qty}@{quote.bid_price}c cash={portfolio.cash:.2f} pos={portfolio.position(ticker)}")
+        return True
+
+    if quote.ask_size > 0 and quote.ask_price is not None and price >= quote.ask_price:
+        qty = min(count, quote.ask_size)
+        if qty <= 0:
+            return False
+        portfolio.apply_fill(ticker, "sell_yes", quote.ask_price, qty)
+        storage.insert_fill(
+            conn, ticker, "sell_yes", quote.ask_price, qty, portfolio.cash, portfolio.position(ticker)
+        )
+        print(f"[fill] {ticker} SELL {qty}@{quote.ask_price}c cash={portfolio.cash:.2f} pos={portfolio.position(ticker)}")
+        return True
+
+    return False
+
+
+async def _refresh_fair_values(
+    conn: sqlite3.Connection,
+    books: dict[str, OrderBook],
+    fair_values: dict[str, int | None],
+    interval_sec: float,
+) -> None:
+    """
+    Periodically re-fetch the weather fair-value signal per ticker in a
+    worker thread (NWS calls are blocking) so it never stalls the WS
+    receive loop. Fetches immediately on startup, then on interval_sec.
+    """
+    while True:
+        for ticker in books:
+            try:
+                result = await asyncio.to_thread(weather_signal.evaluate, ticker)
+            except Exception as e:
+                print(f"[fair_value] {ticker} fetch failed: {e!s}")
+                result = None
+            fair_values[ticker] = result["fair_value_cents"] if result else None
+            top = books[ticker].top_of_book()
+            mid = (
+                (top["best_bid"] + top["best_ask"]) / 2
+                if top.get("best_bid") is not None and top.get("best_ask") is not None
+                else None
+            )
+            storage.insert_fair_value(
+                conn,
+                ticker,
+                result["forecast_temp"] if result else None,
+                result["fair_value_cents"] if result else None,
+                mid,
+            )
+            if result:
+                print(
+                    f"[fair_value] {ticker} forecast={result['forecast_temp']}F "
+                    f"std={result['std_dev']} fair_value={result['fair_value_cents']}c market_mid={mid}"
+                )
+        await asyncio.sleep(interval_sec)
+
+
+async def _periodic_snapshots(
+    conn: sqlite3.Connection,
+    books: dict[str, OrderBook],
+    portfolio: PaperPortfolio,
+    interval_sec: float,
+) -> None:
+    while True:
+        await asyncio.sleep(interval_sec)
+        mids = {}
+        for ticker, book in books.items():
+            storage.insert_book_snapshot(conn, ticker, book.depth_snapshot())
+            top = book.top_of_book()
+            if top.get("best_bid") is not None and top.get("best_ask") is not None:
+                mids[ticker] = (top["best_bid"] + top["best_ask"]) / 2
+        mtm = portfolio.mark_to_market(mids)
+        storage.insert_portfolio_snapshot(conn, portfolio.cash, dict(portfolio.positions))
+        print(f"[portfolio] cash={portfolio.cash:.2f} positions={portfolio.positions} mark_to_market={mtm:.2f}")
+
+
+async def stream_orderbook(
+    conn: sqlite3.Connection,
+    tickers: list[str],
+    get_headers: Callable[[], dict[str, str] | None],
+    portfolio: PaperPortfolio,
+    *,
+    url: str | None = None,
+    snapshot_interval_sec: float = 5.0,
+    half_spread_cents: int = 2,
+    quote_size: int = 10,
+    max_position: int = 50,
+    max_skew_cents: int = 0,
+    max_divergence_cents: int = 15,
+    fair_value_refresh_sec: float = 600.0,
+) -> None:
+    """
+    Connect, subscribe to orderbook_delta + trade for the given tickers,
+    maintain local book state, quote around our fair-value estimate (when
+    available) with inventory skew, and simulate fills against real trade
+    prints into `portfolio`.
+    """
+    ws_url = url or websocket_url()
+    ticker_set = set(tickers)
+    books: dict[str, OrderBook] = {t: OrderBook(t) for t in tickers}
+    quotes: dict[str, strategy.Quote] = {}
+    fair_values: dict[str, int | None] = {}
+    backoff_s = 1.0
+    msg_id = 1
+
+    snapshot_task = asyncio.create_task(
+        _periodic_snapshots(conn, books, portfolio, snapshot_interval_sec)
+    )
+    fair_value_task = asyncio.create_task(
+        _refresh_fair_values(conn, books, fair_values, fair_value_refresh_sec)
+    )
+    try:
+        while True:
+            try:
+                headers = _as_header_list(_fresh_headers(get_headers))
+                async with websockets.connect(
+                    ws_url,
+                    additional_headers=headers,
+                    ssl=_ssl_context(),
+                    ping_interval=20,
+                    ping_timeout=25,
+                    close_timeout=5,
+                ) as ws:
+                    backoff_s = 1.0
+                    sub = {
+                        "id": msg_id,
+                        "cmd": "subscribe",
+                        "params": {"channels": ["orderbook_delta", "trade"], "market_tickers": tickers},
+                    }
+                    msg_id += 1
+                    await ws.send(json.dumps(sub))
+
+                    while True:
+                        raw = await ws.recv()
+                        data = json.loads(raw)
+                        kind = data.get("type")
+                        msg = data.get("msg") or {}
+                        ticker = msg.get("market_ticker")
+
+                        if kind == "orderbook_snapshot" and ticker in ticker_set:
+                            book = books[ticker]
+                            book.apply_snapshot(msg)
+                            storage.insert_book_snapshot(conn, ticker, book.depth_snapshot())
+                            storage.insert_book_top(conn, ticker, book.top_of_book())
+                            _requote(
+                                conn, ticker, book, portfolio, quotes, fair_values,
+                                half_spread_cents=half_spread_cents,
+                                quote_size=quote_size, max_position=max_position,
+                                max_skew_cents=max_skew_cents,
+                                max_divergence_cents=max_divergence_cents,
+                            )
+                        elif kind == "orderbook_delta" and ticker in ticker_set:
+                            book = books[ticker]
+                            book.apply_delta(msg)
+                            storage.insert_book_top(conn, ticker, book.top_of_book())
+                            _requote(
+                                conn, ticker, book, portfolio, quotes, fair_values,
+                                half_spread_cents=half_spread_cents,
+                                quote_size=quote_size, max_position=max_position,
+                                max_skew_cents=max_skew_cents,
+                                max_divergence_cents=max_divergence_cents,
+                            )
+                        elif kind == "trade" and ticker in ticker_set:
+                            trade = _parse_trade(msg)
+                            storage.insert_trade(conn, ticker, trade)
+                            print(
+                                f"[trade] {ticker} yes_price={trade['yes_price']} "
+                                f"count={trade['count']} taker={trade['taker_side']}"
+                            )
+                            quote = quotes.get(ticker)
+                            if quote is not None and _simulate_fill(conn, ticker, trade, quote, portfolio):
+                                _requote(
+                                    conn, ticker, books[ticker], portfolio, quotes, fair_values,
+                                    half_spread_cents=half_spread_cents,
+                                    quote_size=quote_size, max_position=max_position,
+                                    max_skew_cents=max_skew_cents,
+                                    max_divergence_cents=max_divergence_cents,
+                                )
+                        elif kind == "error":
+                            err = msg or {}
+                            print(f"[WS error] {err.get('code')}: {err.get('msg')}")
+                        elif kind == "subscribed":
+                            print(f"[WS] subscribed: {data.get('msg')}")
+                        elif kind == "ok":
+                            pass
+
+            except (WebSocketException, OSError, RuntimeError, json.JSONDecodeError) as e:
+                print(f"[WS] {e!s}; reconnecting in {backoff_s:.0f}s")
+                await asyncio.sleep(backoff_s)
+                backoff_s = min(backoff_s * 2, 60.0)
+    finally:
+        snapshot_task.cancel()
+        fair_value_task.cancel()

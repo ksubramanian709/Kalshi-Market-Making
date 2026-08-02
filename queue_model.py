@@ -75,15 +75,21 @@ def on_trade(
     if quote_bid_size > 0 and quote_bid_price is not None and trade_price <= quote_bid_price:
         qs.bid_consumed += trade_qty
         available = qs.bid_consumed - qs.bid_ahead - qs.bid_filled
-        if available > 0:
-            bid_fill = min(available, quote_bid_size - qs.bid_filled)
+        remaining_size = quote_bid_size - qs.bid_filled
+        # remaining_size can go negative if our quoted size shrank (position
+        # approaching the cap) since the last fill at this same price — bid_filled
+        # only resets on a price change, not a size change. Guard against it,
+        # otherwise min(available, negative) silently produces a negative "fill".
+        if available > 0 and remaining_size > 0:
+            bid_fill = min(available, remaining_size)
             qs.bid_filled += bid_fill
 
     if quote_ask_size > 0 and quote_ask_price is not None and trade_price >= quote_ask_price:
         qs.ask_consumed += trade_qty
         available = qs.ask_consumed - qs.ask_ahead - qs.ask_filled
-        if available > 0:
-            ask_fill = min(available, quote_ask_size - qs.ask_filled)
+        remaining_size = quote_ask_size - qs.ask_filled
+        if available > 0 and remaining_size > 0:
+            ask_fill = min(available, remaining_size)
             qs.ask_filled += ask_fill
 
     return bid_fill, ask_fill

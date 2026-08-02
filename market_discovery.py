@@ -96,8 +96,25 @@ def discover_active_markets(target_date: date | None = None) -> list[str]:
     return tickers
 
 
+def _event_base(ticker: str) -> str:
+    """
+    Strips the trailing '-SIDE' (e.g. '-IND', '-PHI') to identify the
+    underlying event a market belongs to. Two markets sharing an event base
+    are opposite sides of the SAME game — e.g.
+    'KXWNBAGAME-26AUG02INDMIN-IND' and 'KXWNBAGAME-26AUG02INDMIN-MIN' both
+    resolve on the same Indiana-vs-Minnesota game. Holding both isn't
+    diversification, it's the same directional bet doubled up: if Indiana
+    wins, a long-IND position and a short-MIN position both pay off
+    together; if Minnesota wins, both lose together.
+    """
+    return ticker.rsplit("-", 1)[0]
+
+
 def find_liquid_game_markets(series: str, limit: int = MAX_PER_GAME_SERIES) -> list[tuple[float, str]]:
-    """Up to `limit` liquid open markets in a game series, as (volume, ticker), sorted by volume desc."""
+    """
+    Up to `limit` liquid open markets in a game series, as (volume, ticker),
+    sorted by volume desc, with at most one side per underlying event.
+    """
     url = f"{REST_BASE}/markets?series_ticker={series}&status=open&limit=100"
     try:
         data = _fetch_json(url)
@@ -113,7 +130,18 @@ def find_liquid_game_markets(series: str, limit: int = MAX_PER_GAME_SERIES) -> l
             candidates.append((volume, m["ticker"]))
 
     candidates.sort(reverse=True)
-    return candidates[:limit]
+
+    deduped: list[tuple[float, str]] = []
+    seen_events: set[str] = set()
+    for volume, ticker in candidates:
+        event = _event_base(ticker)
+        if event in seen_events:
+            continue
+        seen_events.add(event)
+        deduped.append((volume, ticker))
+        if len(deduped) >= limit:
+            break
+    return deduped
 
 
 def discover_diverse_markets(total_limit: int = 20, target_date: date | None = None) -> list[str]:

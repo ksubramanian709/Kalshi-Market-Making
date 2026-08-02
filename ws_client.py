@@ -21,6 +21,7 @@ import websockets
 from websockets.exceptions import WebSocketException
 
 import queue_model
+import settlement
 import storage
 import strategy
 import weather_signal
@@ -97,7 +98,7 @@ def _requote(
     conn: sqlite3.Connection,
     ticker: str,
     book: OrderBook,
-    portfolio: PaperPortfolio,
+    portfolio_conservative: PaperPortfolio,
     quotes: dict[str, strategy.Quote],
     fair_values: dict[str, int | None],
     queue_states: dict[str, queue_model.QueueState],
@@ -108,13 +109,19 @@ def _requote(
     max_skew_cents: int,
     max_divergence_cents: int,
 ) -> None:
-    """Recompute our quote for a ticker and log it if it changed."""
+    """
+    Recompute our quote for a ticker and log it if it changed. Position-based
+    sizing/skew is driven by the queue-aware (conservative) portfolio — the
+    realistic one — not the optimistic one. Otherwise the "real" model's risk
+    wouldn't actually be self-limited by its own position: it would inherit
+    caps computed from a different, unrealistically-filled portfolio's state.
+    """
     prev = quotes.get(ticker)
     quote = strategy.compute_quotes(
         book.top_of_book(),
         half_spread_cents=half_spread_cents,
         quote_size=quote_size,
-        position=portfolio.position(ticker),
+        position=portfolio_conservative.position(ticker),
         max_position=max_position,
         max_skew_cents=max_skew_cents,
         fair_value_cents=fair_values.get(ticker),
@@ -198,18 +205,21 @@ def _simulate_conservative_fill(
     quote: strategy.Quote,
     qs: queue_model.QueueState,
     portfolio_conservative: PaperPortfolio,
-) -> None:
+) -> bool:
     """
     Queue-aware counterpart to _simulate_fill: only fills once real trade
     volume at this price has consumed the real depth that was resting ahead
     of us. Evaluated against the SAME quote as the optimistic model (see
     queue_model.py) so any P&L difference between the two isolates the
     fill-assumption effect specifically, not a difference in what we quoted.
+
+    Returns True if a fill was simulated (caller should requote afterward —
+    this portfolio's position now drives future quotes, see _requote).
     """
     price = trade.get("yes_price")
     count = trade.get("count")
     if price is None or count is None:
-        return
+        return False
 
     bid_fill, ask_fill = queue_model.on_trade(
         qs,
@@ -242,6 +252,8 @@ def _simulate_conservative_fill(
             f"[fill:conservative] {ticker} SELL {ask_fill}@{quote.ask_price}c "
             f"cash={portfolio_conservative.cash:.2f} pos={portfolio_conservative.position(ticker)}"
         )
+
+    return bid_fill > 0 or ask_fill > 0
 
 
 async def _refresh_fair_values(
@@ -299,6 +311,18 @@ async def _periodic_snapshots(
             top = book.top_of_book()
             if top.get("best_bid") is not None and top.get("best_ask") is not None:
                 mids[ticker] = (top["best_bid"] + top["best_ask"]) / 2
+
+        # A ticker with no live bid/ask isn't necessarily worth $0 to us — the
+        # market may have settled against or for us. Check the real result
+        # (cheap: cached forever once found) before mark_to_market silently
+        # treats it as contributing nothing, which would hide a real win or
+        # loss the moment a market closes. Off the hot path (60s tick), so a
+        # thread-pool call here is fine.
+        held_tickers = set(portfolio.positions) | set(portfolio_conservative.positions)
+        for ticker in held_tickers - set(mids):
+            cents = await asyncio.to_thread(settlement.get_settlement_cents, ticker)
+            if cents is not None:
+                mids[ticker] = cents
 
         mtm = portfolio.mark_to_market(mids)
         storage.insert_portfolio_snapshot(conn, portfolio.cash, dict(portfolio.positions), model="optimistic")
@@ -369,6 +393,14 @@ async def stream_orderbook(
                 ) as ws:
                     backoff_s = 1.0
                     last_seq_by_sid: dict[int, int] = {}
+                    # Fresh queue-position tracking every reconnect: whatever real depth
+                    # was "ahead of us" pre-reconnect is stale the moment we lose the
+                    # connection, since real trading keeps happening during the gap. If
+                    # the post-reconnect quote happens to land at the same price as
+                    # before, sync_quote_price's price-changed check alone wouldn't catch
+                    # this — it only resets on an actual price change.
+                    for ticker in queue_states:
+                        queue_states[ticker] = queue_model.QueueState()
                     sub = {
                         "id": msg_id,
                         "cmd": "subscribe",
@@ -409,7 +441,7 @@ async def stream_orderbook(
                             storage.insert_book_snapshot(conn, ticker, book.depth_snapshot())
                             storage.insert_book_top(conn, ticker, book.top_of_book())
                             _requote(
-                                conn, ticker, book, portfolio, quotes, fair_values, queue_states,
+                                conn, ticker, book, portfolio_conservative, quotes, fair_values, queue_states,
                                 half_spread_cents=half_spread_cents,
                                 quote_size=quote_size, max_position=max_position,
                                 max_skew_cents=max_skew_cents,
@@ -421,7 +453,7 @@ async def stream_orderbook(
                             _assert_not_crossed(ticker, book)
                             storage.insert_book_top(conn, ticker, book.top_of_book())
                             _requote(
-                                conn, ticker, book, portfolio, quotes, fair_values, queue_states,
+                                conn, ticker, book, portfolio_conservative, quotes, fair_values, queue_states,
                                 half_spread_cents=half_spread_cents,
                                 quote_size=quote_size, max_position=max_position,
                                 max_skew_cents=max_skew_cents,
@@ -437,10 +469,14 @@ async def stream_orderbook(
                             quote = quotes.get(ticker)
                             if quote is not None:
                                 qs = queue_states.setdefault(ticker, queue_model.QueueState())
-                                _simulate_conservative_fill(conn, ticker, trade, quote, qs, portfolio_conservative)
-                                if _simulate_fill(conn, ticker, trade, quote, portfolio):
+                                # Both models evaluate this trade against the SAME pre-trade
+                                # quote (captured above) — isolates the fill-assumption effect.
+                                # Only the conservative fill can change future quotes, since
+                                # quoting is driven by the conservative (real) position.
+                                _simulate_fill(conn, ticker, trade, quote, portfolio)
+                                if _simulate_conservative_fill(conn, ticker, trade, quote, qs, portfolio_conservative):
                                     _requote(
-                                        conn, ticker, books[ticker], portfolio, quotes, fair_values, queue_states,
+                                        conn, ticker, books[ticker], portfolio_conservative, quotes, fair_values, queue_states,
                                         half_spread_cents=half_spread_cents,
                                         quote_size=quote_size, max_position=max_position,
                                         max_skew_cents=max_skew_cents,

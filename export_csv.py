@@ -88,14 +88,14 @@ def main() -> None:
         writer.writerows(rows)
 
     mids = {r[0]: (r[2] + r[4]) / 2 / 100 for r in rows if r[2] is not None and r[4] is not None}
-    cash, positions, mtm = portfolio_summary(conn, "optimistic", mids, args.starting_cash)
     cash_c, positions_c, mtm_c = portfolio_summary(conn, "conservative", mids, args.starting_cash)
+    cash, positions, mtm = portfolio_summary(conn, "optimistic", mids, args.starting_cash)
 
     with open(out_dir / "pnl_summary.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["model", "cash", "mark_to_market", "pnl_vs_starting_cash", "starting_cash"])
-        writer.writerow(["optimistic", f"{cash:.2f}", f"{mtm:.2f}", f"{mtm - args.starting_cash:.2f}", args.starting_cash])
-        writer.writerow(["conservative", f"{cash_c:.2f}", f"{mtm_c:.2f}", f"{mtm_c - args.starting_cash:.2f}", args.starting_cash])
+        writer.writerow(["REAL: conservative (queue-aware)", f"{cash_c:.2f}", f"{mtm_c:.2f}", f"{mtm_c - args.starting_cash:.2f}", args.starting_cash])
+        writer.writerow(["reference only: optimistic (ignores queue priority)", f"{cash:.2f}", f"{mtm:.2f}", f"{mtm - args.starting_cash:.2f}", args.starting_cash])
         writer.writerow(["gap (optimistic - conservative)", f"{cash - cash_c:.2f}", f"{mtm - mtm_c:.2f}", "", ""])
 
     conn.close()

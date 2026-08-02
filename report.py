@@ -47,20 +47,20 @@ def main() -> None:
     ):
         print(f"  {ticker}: bid {bp}c x{bs}  ask {ap}c x{aszs}")
 
-    print("\n=== Fills (optimistic) ===")
+    print("\n=== Fills (queue-aware — the realistic number) ===")
     fills = conn.execute(
         "SELECT ticker, datetime(ts, 'unixepoch', 'localtime'), side, price, qty, cash_after, position_after "
-        "FROM fills WHERE model='optimistic' ORDER BY ts"
+        "FROM fills WHERE model='conservative' ORDER BY ts"
     ).fetchall()
     if not fills:
         print("  (none yet)")
     for ticker, ts, side, price, qty, cash_after, pos_after in fills:
         print(f"  {ts}  {ticker}  {side} {qty}@{price}c  cash={cash_after:.2f}  pos={pos_after}")
 
-    n_conservative_fills = conn.execute(
-        "SELECT COUNT(*) FROM fills WHERE model='conservative'"
+    n_optimistic_fills = conn.execute(
+        "SELECT COUNT(*) FROM fills WHERE model='optimistic'"
     ).fetchone()[0]
-    print(f"\n=== Fills (conservative / queue-aware): {n_conservative_fills} total ===")
+    print(f"\n  (reference only: the optimistic/no-queue-priority model logged {n_optimistic_fills} fills over the same period)")
 
     mids = {}
     for ticker, _ts2, bb, _bbq, ba, _baq in latest_per_ticker(
@@ -81,28 +81,32 @@ def main() -> None:
         mtm = cash + sum(pos * (mids[t] / 100) for t, pos in positions.items() if t in mids)
         return cash, positions, mtm
 
-    print("\n=== Portfolio: optimistic vs conservative (queue-aware) ===")
-    opt = portfolio_summary("optimistic")
+    print("\n=== Portfolio (queue-aware — treat this as the real number) ===")
     cons = portfolio_summary("conservative")
-    if opt:
-        cash, positions, mtm = opt
-        print(f"  [optimistic]   cash: {cash:.2f}  mark-to-market: {mtm:.2f}  positions: {positions}")
-        if args.starting_cash is not None:
-            print(f"                 P&L vs starting cash ({args.starting_cash:.2f}): {mtm - args.starting_cash:+.2f}")
-    else:
-        print("  [optimistic]   (no snapshot yet)")
+    opt = portfolio_summary("optimistic")
     if cons:
         cash_c, positions_c, mtm_c = cons
-        print(f"  [conservative] cash: {cash_c:.2f}  mark-to-market: {mtm_c:.2f}  positions: {positions_c}")
+        print(f"  cash: {cash_c:.2f}")
+        print(f"  positions: {positions_c}")
+        print(f"  mark-to-market: {mtm_c:.2f}")
         if args.starting_cash is not None:
-            print(f"                 P&L vs starting cash ({args.starting_cash:.2f}): {mtm_c - args.starting_cash:+.2f}")
+            print(f"  P&L vs starting cash ({args.starting_cash:.2f}): {mtm_c - args.starting_cash:+.2f}")
     else:
-        print("  [conservative] (no snapshot yet)")
+        print("  (no snapshot yet)")
+
+    print("\n  --- reference only, not the number to make decisions on ---")
+    if opt:
+        cash, positions, mtm = opt
+        print(f"  [optimistic, ignores queue priority] mark-to-market: {mtm:.2f}", end="")
+        if args.starting_cash is not None:
+            print(f"  (P&L {mtm - args.starting_cash:+.2f})")
+        else:
+            print()
+    else:
+        print("  [optimistic] (no snapshot yet)")
     if opt and cons:
         gap = opt[2] - cons[2]
-        print(f"\n  >>> Fill-model gap (optimistic mtm - conservative mtm): {gap:+.2f} <<<")
-        print("      This is the quantified effect of ignoring queue priority — the answer to")
-        print("      'how much would this affect us before going live.'")
+        print(f"  gap (optimistic - queue-aware): {gap:+.2f} — how much the naive model overstates P&L right now")
 
     conn.close()
 

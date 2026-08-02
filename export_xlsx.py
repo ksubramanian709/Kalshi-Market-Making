@@ -75,17 +75,20 @@ def main() -> None:
     ).fetchall()
 
     mids = {r[0]: (r[2] + r[4]) / 2 / 100 for r in status_rows if r[2] is not None and r[4] is not None}
-    cash, positions, mtm = portfolio_summary(conn, "optimistic", mids, args.starting_cash)
     cash_c, positions_c, mtm_c = portfolio_summary(conn, "conservative", mids, args.starting_cash)
+    cash, positions, mtm = portfolio_summary(conn, "optimistic", mids, args.starting_cash)
 
     wb = Workbook()
 
+    # Headline: queue-aware (conservative) is the realistic number. Optimistic
+    # ignores queue priority (assumes any crossing trade fills us) and is kept
+    # only as a reference upper bound — see Model Comparison.
     ws_summary = wb.active
     ws_summary.title = "Summary"
     write_sheet(
         ws_summary,
         ["cash", "mark_to_market", "pnl_vs_starting_cash", "starting_cash", "open_positions"],
-        [(round(cash, 2), round(mtm, 2), round(mtm - args.starting_cash, 2), args.starting_cash, str(positions))],
+        [(round(cash_c, 2), round(mtm_c, 2), round(mtm_c - args.starting_cash, 2), args.starting_cash, str(positions_c))],
     )
 
     ws_compare = wb.create_sheet("Model Comparison")
@@ -93,11 +96,11 @@ def main() -> None:
         ws_compare,
         ["model", "cash", "mark_to_market", "pnl_vs_starting_cash", "positions"],
         [
-            ("optimistic (any crossing trade fills us)", round(cash, 2), round(mtm, 2),
-             round(mtm - args.starting_cash, 2), str(positions)),
-            ("conservative (queue-aware, needs real volume to clear depth ahead of us)",
+            ("REAL: queue-aware (needs real volume to clear depth ahead of us before we fill)",
              round(cash_c, 2), round(mtm_c, 2), round(mtm_c - args.starting_cash, 2), str(positions_c)),
-            ("GAP (optimistic - conservative) — the quantified effect of ignoring queue priority",
+            ("reference only: optimistic (ignores queue priority, any crossing trade fills us)",
+             round(cash, 2), round(mtm, 2), round(mtm - args.starting_cash, 2), str(positions)),
+            ("gap (optimistic - queue-aware) — how much the naive model overstates P&L",
              round(cash - cash_c, 2), round(mtm - mtm_c, 2), round((mtm - args.starting_cash) - (mtm_c - args.starting_cash), 2), ""),
         ],
     )

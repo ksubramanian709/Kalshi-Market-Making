@@ -265,6 +265,7 @@ async def stream_orderbook(
                     close_timeout=5,
                 ) as ws:
                     backoff_s = 1.0
+                    last_seq_by_sid: dict[int, int] = {}
                     sub = {
                         "id": msg_id,
                         "cmd": "subscribe",
@@ -277,6 +278,24 @@ async def stream_orderbook(
                         raw = await ws.recv()
                         data = json.loads(raw)
                         kind = data.get("type")
+
+                        # Kalshi tags each message on a channel subscription (sid) with an
+                        # incrementing seq. A gap means we missed a message — most
+                        # dangerously an orderbook_delta, which would silently leave our
+                        # local book permanently wrong (stale phantom price levels) since
+                        # we otherwise only resync via a fresh snapshot on reconnect. Force
+                        # that reconnect immediately rather than keep quoting off a
+                        # possibly-corrupted book.
+                        sid = data.get("sid")
+                        seq = data.get("seq")
+                        if sid is not None and seq is not None:
+                            expected = last_seq_by_sid.get(sid)
+                            if expected is not None and seq != expected + 1:
+                                raise RuntimeError(
+                                    f"orderbook seq gap on sid={sid}: expected {expected + 1}, got {seq}"
+                                )
+                            last_seq_by_sid[sid] = seq
+
                         msg = data.get("msg") or {}
                         ticker = msg.get("market_ticker")
 

@@ -21,26 +21,14 @@ RISK_MAX_POSITION_PER_MARKET = 3
 RISK_MAX_TOTAL_NOTIONAL = 100.0
 RISK_MAX_LOSS = 30.0
 
-TRACKED_MARKETS = [
-    "KXHIGHLAX-26AUG02-B78.5",
-    "KXHIGHAUS-26AUG02-B101.5",
-    "KXHIGHCHI-26AUG02-B73.5",
-    "KXHIGHDEN-26AUG02-B102.5",
-    "KXMLBGAME-26AUG021605DETATH-DET",
-    "KXWNBAGAME-26AUG02TORGS-TOR",
-    "KXWNBAGAME-26AUG02CONNDAL-CONN",
-    "KXWNBAGAME-26AUG03LVATL-LV",
-    "KXNFLGAME-26AUG06CARARI-CAR",
-    "KXWNBAGAME-26AUG03PHXCHI-PHX",
-    "KXNFLGAME-26SEP13MIALV-LV",
-    "KXNFLGAME-26SEP10SFLAR-LAR",
-    "KXNFLGAME-26SEP13GBMIN-GB",
-    "KXNFLGAME-26SEP14DENKC-DEN",
-]
-
-
-def find_live_trader_pid() -> tuple[str, str] | None:
-    """Returns (pid, elapsed) for the running live_trader.py process, or None."""
+def find_live_trader() -> tuple[str, str, list[str]] | None:
+    """
+    Returns (pid, elapsed, tracked_markets) for the running live_trader.py
+    process, or None. Markets are parsed straight out of its actual command
+    line — never a hardcoded list or a rollover file — so this always
+    reflects what's really being quoted, even after a mid-session restart
+    with a different --market set.
+    """
     try:
         out = subprocess.run(
             ["ps", "-eo", "pid,etime,command"], capture_output=True, text=True, timeout=5
@@ -50,8 +38,12 @@ def find_live_trader_pid() -> tuple[str, str] | None:
     for line in out.splitlines():
         if "live_trader.py" in line and "--live" in line:
             parts = line.strip().split(None, 2)
-            if len(parts) >= 2:
-                return parts[0], parts[1]
+            if len(parts) < 3:
+                continue
+            pid, elapsed, cmd = parts[0], parts[1], parts[2]
+            args = cmd.split()
+            markets = [args[i + 1] for i in range(len(args) - 1) if args[i] == "--market"]
+            return pid, elapsed, markets
     return None
 
 
@@ -70,7 +62,7 @@ def gather() -> dict:
     balance = ko.get_balance()
     positions = ko.get_positions().get("market_positions", [])
     orders = ko.get_orders(status="resting").get("orders", [])
-    pid_info = find_live_trader_pid()
+    live_info = find_live_trader()
 
     pos_by_ticker = {p["ticker"]: p for p in positions}
     orders_by_ticker: dict[str, dict[str, dict]] = {}
@@ -84,8 +76,17 @@ def gather() -> dict:
     realized_pnl_total = sum(float(p.get("realized_pnl_dollars", 0) or 0) for p in positions)
     open_exposure_total = sum(float(p.get("market_exposure_dollars", 0) or 0) for p in positions)
 
+    if live_info:
+        tracked_markets = live_info[2]
+    else:
+        # Process isn't running — fall back to whatever's still actually on
+        # the account (positions + resting orders) rather than a stale list,
+        # so the report never claims a market is "waiting" when really
+        # nothing is tracking it at all.
+        tracked_markets = sorted(set(pos_by_ticker) | set(orders_by_ticker))
+
     rows = []
-    for ticker in TRACKED_MARKETS:
+    for ticker in tracked_markets:
         pos = pos_by_ticker.get(ticker)
         pos_count = float(pos.get("position_fp", 0) or 0) if pos else 0.0
         exposure = float(pos.get("market_exposure_dollars", 0) or 0) if pos else 0.0
@@ -107,8 +108,8 @@ def gather() -> dict:
         "generated_at": datetime.now(timezone.utc),
         "balance": balance_dollars,
         "pnl": pnl,
-        "pid": pid_info[0] if pid_info else None,
-        "uptime": pid_info[1] if pid_info else None,
+        "pid": live_info[0] if live_info else None,
+        "uptime": live_info[1] if live_info else None,
         "total_position_count": total_position_count,
         "realized_pnl_total": realized_pnl_total,
         "open_exposure_total": open_exposure_total,

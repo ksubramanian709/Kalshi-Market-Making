@@ -13,6 +13,7 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
+import settlement
 import storage
 
 
@@ -36,8 +37,18 @@ def portfolio_summary(conn, model: str, mids: dict, starting_cash: float) -> tup
         return starting_cash, {}, starting_cash
     cash, positions_json = row
     positions = json.loads(positions_json)
-    mtm = cash + sum(pos * mids.get(t, 0) for t, pos in positions.items())
-    return cash, positions, mtm
+    # A market with no live mid isn't necessarily worth $0 — it may have
+    # settled against or for us. Check the real result before excluding it,
+    # which would silently hide a real win or loss.
+    value = cash
+    for t, pos in positions.items():
+        price_dollars = mids.get(t)
+        if price_dollars is None:
+            cents = settlement.get_settlement_cents(t)
+            price_dollars = cents / 100 if cents is not None else None
+        if price_dollars is not None:
+            value += pos * price_dollars
+    return cash, positions, value
 
 
 def main() -> None:

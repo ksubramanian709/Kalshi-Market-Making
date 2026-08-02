@@ -9,6 +9,7 @@ import argparse
 import json
 import sqlite3
 
+import settlement
 import storage
 
 
@@ -78,8 +79,18 @@ def main() -> None:
             return None
         cash, positions_json = row
         positions = json.loads(positions_json)
-        mtm = cash + sum(pos * (mids[t] / 100) for t, pos in positions.items() if t in mids)
-        return cash, positions, mtm
+        # A market that's stopped quoting a live bid/ask isn't necessarily
+        # worth $0 to us — it may have settled against or for us. Check
+        # actual settlement before falling back to excluding it entirely,
+        # which would silently hide a real win or loss.
+        value = cash
+        for t, pos in positions.items():
+            price_cents = mids.get(t)
+            if price_cents is None:
+                price_cents = settlement.get_settlement_cents(t)
+            if price_cents is not None:
+                value += pos * (price_cents / 100)
+        return cash, positions, value
 
     print("\n=== Portfolio (queue-aware — treat this as the real number) ===")
     cons = portfolio_summary("conservative")

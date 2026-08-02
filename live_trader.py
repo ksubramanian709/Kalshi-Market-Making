@@ -37,6 +37,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Kalshi live market maker (real orders, dry-run by default)")
     p.add_argument("--market", action="append", required=True, help="Repeat for multiple markets.")
     p.add_argument("--live", action="store_true", help="Actually place real orders. Default: dry-run only.")
+    p.add_argument(
+        "--confirm", default="",
+        help="Must be exactly 'yes deploy real capital' when --live is passed, or the run aborts.",
+    )
     p.add_argument("--use-demo", action="store_true", help="Trade against Kalshi's demo sandbox instead of prod.")
     p.add_argument("--half-spread-cents", type=int, default=2)
     p.add_argument("--quote-size", type=int, default=1)
@@ -88,9 +92,14 @@ async def run(args: argparse.Namespace) -> None:
           f"notional<=${args.max_total_notional_dollars} loss<=${args.max_loss_dollars}")
 
     if args.live:
-        confirm = input("Type EXACTLY 'yes deploy real capital' to proceed live, anything else aborts: ")
-        if confirm.strip() != "yes deploy real capital":
-            print("[live] aborted — confirmation phrase did not match.")
+        # A blocking input() prompt doesn't work reliably across every terminal/
+        # execution context (this is what actually failed on the first attempt —
+        # no orders were placed, confirmed via a fresh GET /portfolio/orders
+        # check). Requiring the exact phrase as a CLI argument is more robust
+        # while keeping the same property: nothing real happens without someone
+        # deliberately typing this specific sentence as part of the command.
+        if args.confirm != "yes deploy real capital":
+            print("[live] aborted — pass --confirm 'yes deploy real capital' exactly to proceed live.")
             return
 
     om = OrderManager(

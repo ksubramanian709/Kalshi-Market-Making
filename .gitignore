@@ -1,6 +1,7 @@
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/archive/
 data/exports/
 data/*.log
 data/active_markets.txt

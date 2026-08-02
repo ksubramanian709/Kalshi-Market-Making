@@ -45,8 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--snapshot-interval-sec",
         type=float,
-        default=5.0,
-        help="How often to persist a full order-book depth snapshot + portfolio snapshot (default: 5s)",
+        default=60.0,
+        help="How often to persist a full order-book depth snapshot + portfolio snapshot (default: 60s)",
     )
     parser.add_argument(
         "--half-spread-cents",

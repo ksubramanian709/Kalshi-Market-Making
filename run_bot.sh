@@ -29,4 +29,5 @@ exec python -u main.py \
   --max-skew-cents 5 \
   --max-divergence-cents 0 \
   --fair-value-refresh-sec 600 \
+  --snapshot-interval-sec 60 \
   --starting-cash 5000

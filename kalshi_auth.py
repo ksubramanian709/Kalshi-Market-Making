@@ -60,9 +60,13 @@ def websocket_auth_failure_reason() -> str | None:
     return None
 
 
-def build_websocket_headers() -> dict[str, str] | None:
+def build_rest_headers(method: str, path: str) -> dict[str, str] | None:
     """
-    Headers for the WebSocket handshake. Returns None if credentials are missing.
+    Headers for an authenticated REST request. Per Kalshi's docs, the signed
+    message is exactly `timestamp + method + path` — no query string, no
+    request body, regardless of method. `path` must be the full path from
+    the API root (e.g. "/trade-api/v2/portfolio/events/orders"), no query
+    params. Returns None if credentials are missing.
     """
     key_id = os.environ.get("KALSHI_API_KEY_ID")
     key_path = os.environ.get("KALSHI_PRIVATE_KEY_PATH")
@@ -74,7 +78,7 @@ def build_websocket_headers() -> dict[str, str] | None:
 
     private_key = load_private_key_pem(str(path_obj))
     timestamp_ms = str(int(time.time() * 1000))
-    sign_payload = timestamp_ms + "GET" + WS_SIGN_PATH
+    sign_payload = timestamp_ms + method.upper() + path
     signature = sign_pss_sha256(private_key, sign_payload)
 
     return {
@@ -82,3 +86,8 @@ def build_websocket_headers() -> dict[str, str] | None:
         "KALSHI-ACCESS-SIGNATURE": signature,
         "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
     }
+
+
+def build_websocket_headers() -> dict[str, str] | None:
+    """Headers for the WebSocket handshake — a thin wrapper over build_rest_headers."""
+    return build_rest_headers("GET", WS_SIGN_PATH)

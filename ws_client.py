@@ -77,6 +77,21 @@ def _parse_trade(msg: dict) -> dict:
     }
 
 
+def _assert_not_crossed(ticker: str, book: OrderBook) -> None:
+    """
+    A real order book can never have best_bid > best_ask — any real crossing
+    gets matched instantly on the exchange. If our local book ever shows one,
+    our tracked state has diverged from reality (missed message, a bug in
+    delta application, anything) and every quote computed from it is suspect.
+    Checking the seq number catches missed messages specifically; this checks
+    the actual invariant, catching that AND any other cause.
+    """
+    top = book.top_of_book()
+    bb, ba = top.get("best_bid"), top.get("best_ask")
+    if bb is not None and ba is not None and bb > ba:
+        raise RuntimeError(f"{ticker}: local book crossed (bid={bb} > ask={ba}) — forcing resync")
+
+
 def _requote(
     conn: sqlite3.Connection,
     ticker: str,
@@ -302,6 +317,7 @@ async def stream_orderbook(
                         if kind == "orderbook_snapshot" and ticker in ticker_set:
                             book = books[ticker]
                             book.apply_snapshot(msg)
+                            _assert_not_crossed(ticker, book)
                             storage.insert_book_snapshot(conn, ticker, book.depth_snapshot())
                             storage.insert_book_top(conn, ticker, book.top_of_book())
                             _requote(
@@ -314,6 +330,7 @@ async def stream_orderbook(
                         elif kind == "orderbook_delta" and ticker in ticker_set:
                             book = books[ticker]
                             book.apply_delta(msg)
+                            _assert_not_crossed(ticker, book)
                             storage.insert_book_top(conn, ticker, book.top_of_book())
                             _requote(
                                 conn, ticker, book, portfolio, quotes, fair_values,

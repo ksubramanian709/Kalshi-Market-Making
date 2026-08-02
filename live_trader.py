@@ -64,7 +64,9 @@ def _ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
 
-async def _poll_positions(positions: dict[str, int], use_demo: bool, interval_sec: float) -> None:
+async def _poll_positions(
+    positions: dict[str, int], use_demo: bool, interval_sec: float, ready: asyncio.Event
+) -> None:
     """Refreshes `positions` from Kalshi's own records — the ground truth, not our own fill guesses."""
     while True:
         try:
@@ -72,12 +74,19 @@ async def _poll_positions(positions: dict[str, int], use_demo: bool, interval_se
             fresh = {}
             for mp in resp.get("market_positions", []):
                 ticker = mp.get("ticker")
-                # Kalshi reports position as a fixed-point count string; net YES position.
-                qty = mp.get("position")
+                # Kalshi reports position as a fixed-point count string under
+                # "position_fp" (NOT "position" — that key doesn't exist on this
+                # response and mp.get("position") silently returns None for
+                # every market, which is why this was broken: real_positions
+                # stayed empty forever, so neither the strategy's inventory
+                # skew nor risk.py's position/notional/loss checks ever saw a
+                # real position and none of them could ever fire).
+                qty = mp.get("position_fp")
                 if ticker is not None and qty is not None:
                     fresh[ticker] = int(round(float(qty)))
             positions.clear()
             positions.update(fresh)
+            ready.set()
         except Exception as e:
             print(f"[live] position poll failed: {e!s}")
         await asyncio.sleep(interval_sec)
@@ -119,8 +128,14 @@ async def run(args: argparse.Namespace) -> None:
     ticker_set = set(tickers)
     books: dict[str, OrderBook] = {t: OrderBook(t) for t in tickers}
     real_positions: dict[str, int] = {}
+    positions_ready = asyncio.Event()
 
-    position_task = asyncio.create_task(_poll_positions(real_positions, args.use_demo, args.position_poll_sec))
+    position_task = asyncio.create_task(
+        _poll_positions(real_positions, args.use_demo, args.position_poll_sec, positions_ready)
+    )
+    print("[live] waiting for first real-position poll before quoting anything...")
+    await positions_ready.wait()
+    print("[live] real positions loaded, quoting can begin")
 
     backoff_s = 1.0
     try:
@@ -194,7 +209,19 @@ async def run(args: argparse.Namespace) -> None:
                             max_position=args.max_position,
                             max_skew_cents=max_skew_cents,
                         )
-                        om.sync(ticker, quote)
+                        try:
+                            om.sync(ticker, quote)
+                        except Exception as e:
+                            # A single ticker's order-management error (e.g. amending/
+                            # canceling an order that just got filled or pulled
+                            # exchange-side) must not kill the whole session — this is
+                            # exactly what happened when an ask on KXHIGHAUS filled and
+                            # a later cancel 404'd, which used to propagate all the way
+                            # out and crash the loop, orphaning every other market's
+                            # orders. Log it, drop this ticker's local state so the next
+                            # tick recomputes from scratch, and keep going.
+                            print(f"[live] om.sync failed for {ticker}: {e!s}; resetting this ticker (cancels any orphaned resting orders)")
+                            om.reset_ticker(ticker)
 
             except (WebSocketException, OSError, RuntimeError, json.JSONDecodeError) as e:
                 print(f"[live] {e!s}; reconnecting in {backoff_s:.0f}s")

@@ -5,6 +5,7 @@ data/archive/
 data/exports/
 data/*.log
 data/active_markets.txt
+data/live_status.html
 
 # Python
 __pycache__/

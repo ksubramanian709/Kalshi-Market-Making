@@ -129,10 +129,49 @@ class OrderManager:
         print(f"[oms:LIVE] CANCELED {ticker} {api_side} order {resting.order_id}")
         setattr(st, side, None)
 
+    def reset_ticker(self, ticker: str) -> None:
+        """
+        Forcibly cancels and drops tracking for one ticker after a sync error.
+        Must cancel BOTH sides, not just the one that failed — if only the
+        state dict entry is dropped, whichever side didn't error keeps
+        resting on the exchange, untracked, while the next successful sync
+        creates a fresh replacement alongside it. That's exactly how
+        duplicate resting orders piled up on KXHIGHAUS/KXHIGHDEN: one side's
+        amend 404'd, state for the ticker got dropped, and the other side's
+        still-live order was orphaned instead of canceled.
+        """
+        st = self.state.pop(ticker, None)
+        if st is None:
+            return
+        if st.bid is not None:
+            try:
+                kalshi_orders.cancel_order(st.bid.order_id, use_demo=self.use_demo)
+                print(f"[oms] reset_ticker: canceled orphaned {ticker} bid {st.bid.order_id}")
+            except Exception as e:
+                print(f"[oms] reset_ticker: failed to cancel {ticker} bid {st.bid.order_id}: {e!s}")
+        if st.ask is not None:
+            try:
+                kalshi_orders.cancel_order(st.ask.order_id, use_demo=self.use_demo)
+                print(f"[oms] reset_ticker: canceled orphaned {ticker} ask {st.ask.order_id}")
+            except Exception as e:
+                print(f"[oms] reset_ticker: failed to cancel {ticker} ask {st.ask.order_id}: {e!s}")
+
     def cancel_all(self) -> None:
-        """Kill switch: cancel every resting order we're tracking, live or not."""
+        """
+        Kill switch: cancel every resting order we're tracking, live or not.
+        Must never let one bad cancel (e.g. an order that already filled or
+        was already removed exchange-side) stop the rest from being
+        canceled — this is the last line of defense when the bot is shutting
+        down, so it has to be resilient to per-order failures.
+        """
         for ticker, st in self.state.items():
             if st.bid is not None:
-                self._cancel(ticker, st, "bid", st.bid)
+                try:
+                    self._cancel(ticker, st, "bid", st.bid)
+                except Exception as e:
+                    print(f"[oms] cancel_all: failed to cancel {ticker} bid {st.bid.order_id}: {e!s}")
             if st.ask is not None:
-                self._cancel(ticker, st, "ask", st.ask)
+                try:
+                    self._cancel(ticker, st, "ask", st.ask)
+                except Exception as e:
+                    print(f"[oms] cancel_all: failed to cancel {ticker} ask {st.ask.order_id}: {e!s}")

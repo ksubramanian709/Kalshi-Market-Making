@@ -143,6 +143,8 @@ touch quotes) pending validation against real settlements.
 | `report.py` / `status.sh` | Terminal status: book, quotes, fills, P&L |
 | `export_csv.py` / `export_xlsx.py` | CSV / Excel workbook export |
 | `run_bot.sh`, `export.sh` | Wrapper scripts for `launchd` |
+| `market_discovery.py` | Finds the most liquid open bucket market per city via Kalshi REST |
+| `rollover.py` | Refreshes `data/active_markets.txt` with today's liquid tickers |
 
 ## Running it
 
@@ -168,11 +170,22 @@ Check results any time with `python report.py` or `open data/exports/kalshi_mm_r
 ### Running 24/7 (`launchd`, macOS)
 
 ```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kalshimm.bot.plist     # start (KeepAlive + RunAtLoad)
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kalshimm.export.plist  # CSV/Excel refresh every 5 min
-launchctl kickstart -k gui/$(id -u)/com.kalshimm.bot                              # restart after editing run_bot.sh
-launchctl bootout gui/$(id -u)/com.kalshimm.bot                                   # actually stop it (kill alone just respawns it)
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kalshimm.bot.plist       # start (KeepAlive + RunAtLoad)
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kalshimm.export.plist    # CSV/Excel refresh every 5 min
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kalshimm.rollover.plist  # daily 6am ticker refresh
+launchctl kickstart -k gui/$(id -u)/com.kalshimm.bot                                # restart after editing run_bot.sh
+launchctl bootout gui/$(id -u)/com.kalshimm.bot                                     # actually stop it (kill alone just respawns it)
 ```
+
+### Daily market rollover
+
+These are same-day contracts, so `run_bot.sh` runs `rollover.py` on every launch —
+it queries Kalshi REST for the most liquid open bucket market per city (bid > $0.03, ask < $0.97,
+24h volume > 200) and writes the result to `data/active_markets.txt`, which `run_bot.sh` reads to
+build the `--market` list. `com.kalshimm.rollover.plist` forces a bot restart once daily (6am) so this
+refresh actually happens even if the bot itself never crashes. If discovery comes back empty (e.g. too
+early before a new day's markets have liquidity), the previous ticker list is left untouched rather
+than emptied.
 
 ## Honesty / limitations
 

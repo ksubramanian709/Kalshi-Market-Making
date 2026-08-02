@@ -1,19 +1,28 @@
 #!/bin/bash
-# Wrapper so launchd has one stable command to invoke. Edit the --market list
-# or strategy params here, then `launchctl kickstart -k` to apply (see README/commands
-# printed by setup_launchd.sh).
+# Wrapper so launchd has one stable command to invoke. Refreshes the active
+# market list (rollover.py) on every launch, so both a crash-triggered
+# restart and the daily com.kalshimm.rollover job naturally pick up fresh
+# tickers as each day's markets expire. Edit strategy params below, then
+# `launchctl kickstart -k gui/$(id -u)/com.kalshimm.bot` to apply.
 set -euo pipefail
 cd "$(dirname "$0")"
 source .venv/bin/activate
 source .env.sh
 
+python rollover.py
+
+MARKET_ARGS=()
+while IFS= read -r ticker; do
+  [ -n "$ticker" ] && MARKET_ARGS+=(--market "$ticker")
+done < data/active_markets.txt
+
+if [ ${#MARKET_ARGS[@]} -eq 0 ]; then
+  echo "[run_bot] no active markets found in data/active_markets.txt, aborting" >&2
+  exit 1
+fi
+
 exec python -u main.py \
-  --market KXHIGHLAX-26AUG02-B80.5 \
-  --market KXHIGHNY-26AUG02-B82.5 \
-  --market KXHIGHMIA-26AUG02-B92.5 \
-  --market KXHIGHNY-26AUG02-B80.5 \
-  --market KXHIGHPHIL-26AUG02-B91.5 \
-  --market KXHIGHAUS-26AUG02-B99.5 \
+  "${MARKET_ARGS[@]}" \
   --half-spread-cents 1 \
   --quote-size 10 \
   --max-position 50 \

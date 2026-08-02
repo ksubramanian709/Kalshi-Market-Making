@@ -3,6 +3,7 @@ data/*.db-wal
 data/*.db-shm
 data/exports/
 data/*.log
+data/active_markets.txt
 
 # Python
 __pycache__/
